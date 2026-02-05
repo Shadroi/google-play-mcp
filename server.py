@@ -1,0 +1,602 @@
+"""Google Play Developer API MCP Server.
+
+Provides tools for managing Google Play app deployment and in-app products:
+- deploy_internal: Upload AAB and deploy to internal testing track
+- create_inapp_product: Create or update an in-app product
+- activate_inapp_product: Activate a draft in-app product
+- list_inapp_products: List all in-app products
+- list_subscriptions: List all subscription products
+"""
+
+import json
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+from mcp.server.fastmcp import FastMCP
+
+load_dotenv(Path(__file__).parent / ".env")
+
+mcp = FastMCP("google-play")
+
+SCOPES = ["https://www.googleapis.com/auth/androidpublisher"]
+
+
+def _get_service():
+    """Create Google Play Developer API service from environment variables."""
+    key_file = os.environ.get("GOOGLE_PLAY_KEY_FILE")
+    if not key_file:
+        raise ValueError(
+            "GOOGLE_PLAY_KEY_FILE environment variable is not set. "
+            "Please set it to the path of your service account JSON key file."
+        )
+    if not os.path.exists(key_file):
+        raise ValueError(f"Service account key file not found: {key_file}")
+
+    credentials = service_account.Credentials.from_service_account_file(
+        key_file, scopes=SCOPES
+    )
+    return build("androidpublisher", "v3", credentials=credentials)
+
+
+def _get_package_name() -> str:
+    """Get the package name from environment variable."""
+    package_name = os.environ.get("GOOGLE_PLAY_PACKAGE_NAME")
+    if not package_name:
+        raise ValueError(
+            "GOOGLE_PLAY_PACKAGE_NAME environment variable is not set. "
+            "Please set it to your app's package name (e.g., com.example.app)."
+        )
+    return package_name
+
+
+def _convert_region_prices(service, package_name: str, price_usd_micros: int) -> dict:
+    """Convert USD price to all regional prices."""
+    units = price_usd_micros // 1_000_000
+    nanos = (price_usd_micros % 1_000_000) * 1000
+
+    result = service.monetization().convertRegionPrices(
+        packageName=package_name,
+        body={
+            "price": {
+                "currencyCode": "USD",
+                "units": str(units),
+                "nanos": nanos,
+            }
+        },
+    ).execute()
+
+    return result
+
+
+@mcp.tool()
+def deploy_internal(
+    aab_path: str,
+    release_notes_ko: str = "",
+    release_notes_en: str = "",
+    status: str = "draft",
+) -> str:
+    """Deploy an Android App Bundle to the internal testing track.
+
+    IMPORTANT: This will upload your app bundle to Google Play.
+    Make sure you have the correct bundle file before proceeding.
+
+    Args:
+        aab_path: Path to the .aab file to upload.
+        release_notes_ko: Release notes in Korean (optional).
+        release_notes_en: Release notes in English (optional).
+        status: Release status - "draft" for unpublished apps, "completed" for
+                published apps. Default is "draft".
+
+    Returns:
+        A message indicating success with version code and edit ID.
+    """
+    service = _get_service()
+    package_name = _get_package_name()
+
+    if not os.path.exists(aab_path):
+        raise ValueError(f"AAB file not found: {aab_path}")
+
+    # 1. Create edit
+    edit = service.edits().insert(packageName=package_name, body={}).execute()
+    edit_id = edit["id"]
+
+    try:
+        # 2. Upload bundle
+        media = MediaFileUpload(aab_path, mimetype="application/octet-stream")
+        bundle = service.edits().bundles().upload(
+            packageName=package_name,
+            editId=edit_id,
+            media_body=media,
+        ).execute()
+        version_code = bundle["versionCode"]
+
+        # 3. Set track
+        release_notes = []
+        if release_notes_ko:
+            release_notes.append({"language": "ko-KR", "text": release_notes_ko})
+        if release_notes_en:
+            release_notes.append({"language": "en-US", "text": release_notes_en})
+
+        track_body = {
+            "track": "internal",
+            "releases": [{
+                "versionCodes": [str(version_code)],
+                "status": status,
+            }],
+        }
+        if release_notes:
+            track_body["releases"][0]["releaseNotes"] = release_notes
+
+        service.edits().tracks().update(
+            packageName=package_name,
+            editId=edit_id,
+            track="internal",
+            body=track_body,
+        ).execute()
+
+        # 4. Commit
+        service.edits().commit(packageName=package_name, editId=edit_id).execute()
+
+        return (
+            f"Successfully deployed to internal testing track.\n"
+            f"Version code: {version_code}\n"
+            f"Status: {status}\n"
+            f"Edit ID: {edit_id}"
+        )
+
+    except Exception as e:
+        # Delete edit on failure
+        try:
+            service.edits().delete(packageName=package_name, editId=edit_id).execute()
+        except Exception:
+            pass
+        raise e
+
+
+@mcp.tool()
+def create_inapp_product(
+    sku: str,
+    title_ko: str,
+    title_en: str,
+    description_ko: str,
+    description_en: str,
+    price_usd: float,
+) -> str:
+    """Create or update an in-app product (managed product).
+
+    Uses the new monetization API with automatic regional price conversion.
+    If the product already exists, it will be updated.
+
+    IMPORTANT: The app must have BILLING permission and Play Billing Library
+    in an uploaded bundle before products can be created.
+
+    Args:
+        sku: Product ID (e.g., "gems_100"). Only lowercase, numbers, underscores.
+        title_ko: Product title in Korean.
+        title_en: Product title in English.
+        description_ko: Product description in Korean.
+        description_en: Product description in English.
+        price_usd: Price in USD (e.g., 0.99 for $0.99).
+
+    Returns:
+        A message indicating success with product details.
+    """
+    service = _get_service()
+    package_name = _get_package_name()
+
+    price_micros = int(price_usd * 1_000_000)
+
+    # Convert prices
+    converted = _convert_region_prices(service, package_name, price_micros)
+    regions_version = converted["regionVersion"]["version"]
+
+    # Build regional configs
+    regional_configs = []
+    for region_code, price_data in converted["convertedRegionPrices"].items():
+        price = price_data["price"]
+        regional_configs.append({
+            "regionCode": region_code,
+            "price": {
+                "currencyCode": price["currencyCode"],
+                "units": price.get("units", "0"),
+                "nanos": price.get("nanos", 0),
+            },
+            "availability": "AVAILABLE",
+        })
+
+    # New regions config
+    other = converted.get("convertedOtherRegionsPrice", {})
+    new_regions_config = {
+        "availability": "AVAILABLE",
+        "usdPrice": other.get("usdPrice", {"currencyCode": "USD", "units": str(int(price_usd)), "nanos": int((price_usd % 1) * 1_000_000_000)}),
+        "eurPrice": other.get("eurPrice", {"currencyCode": "EUR", "units": str(int(price_usd)), "nanos": int((price_usd % 1) * 1_000_000_000)}),
+    }
+
+    # Listings
+    listings = [
+        {"languageCode": "ko-KR", "title": title_ko, "description": description_ko},
+        {"languageCode": "en-US", "title": title_en, "description": description_en},
+    ]
+
+    # Purchase option ID (no underscores allowed)
+    purchase_option_id = sku.replace("_", "-") + "-default"
+
+    body = {
+        "packageName": package_name,
+        "productId": sku,
+        "listings": listings,
+        "purchaseOptions": [{
+            "purchaseOptionId": purchase_option_id,
+            "buyOption": {"legacyCompatible": True},
+            "regionalPricingAndAvailabilityConfigs": regional_configs,
+            "newRegionsConfig": new_regions_config,
+        }],
+    }
+
+    # Patch with allowMissing=True for upsert behavior
+    request = service.monetization().onetimeproducts().patch(
+        packageName=package_name,
+        productId=sku,
+        body=body,
+        allowMissing=True,
+        updateMask="listings,purchaseOptions",
+    )
+
+    # Add regionsVersion.version parameter manually
+    sep = "&" if "?" in request.uri else "?"
+    request.uri += f"{sep}regionsVersion.version={regions_version}"
+
+    result = request.execute()
+
+    return (
+        f"Successfully created/updated in-app product.\n"
+        f"SKU: {sku}\n"
+        f"Price: ${price_usd:.2f} USD\n"
+        f"Regions: {len(regional_configs)}\n"
+        f"Status: Product is in DRAFT state. Use activate_inapp_product to activate."
+    )
+
+
+@mcp.tool()
+def activate_inapp_product(sku: str) -> str:
+    """Activate a draft in-app product to make it available for purchase.
+
+    Args:
+        sku: Product ID to activate (e.g., "gems_100").
+
+    Returns:
+        A message indicating success.
+    """
+    service = _get_service()
+    package_name = _get_package_name()
+
+    purchase_option_id = sku.replace("_", "-") + "-default"
+
+    service.monetization().onetimeproducts().purchaseOptions().batchUpdateStates(
+        packageName=package_name,
+        productId=sku,
+        body={
+            "requests": [{
+                "activatePurchaseOptionRequest": {
+                    "packageName": package_name,
+                    "productId": sku,
+                    "purchaseOptionId": purchase_option_id,
+                }
+            }]
+        },
+    ).execute()
+
+    return f"Successfully activated in-app product: {sku}"
+
+
+@mcp.tool()
+def deactivate_inapp_product(sku: str) -> str:
+    """Deactivate an active in-app product.
+
+    Args:
+        sku: Product ID to deactivate (e.g., "gems_100").
+
+    Returns:
+        A message indicating success.
+    """
+    service = _get_service()
+    package_name = _get_package_name()
+
+    purchase_option_id = sku.replace("_", "-") + "-default"
+
+    service.monetization().onetimeproducts().purchaseOptions().batchUpdateStates(
+        packageName=package_name,
+        productId=sku,
+        body={
+            "requests": [{
+                "deactivatePurchaseOptionRequest": {
+                    "packageName": package_name,
+                    "productId": sku,
+                    "purchaseOptionId": purchase_option_id,
+                }
+            }]
+        },
+    ).execute()
+
+    return f"Successfully deactivated in-app product: {sku}"
+
+
+@mcp.tool()
+def list_inapp_products() -> str:
+    """List all one-time in-app products for the app.
+
+    Returns:
+        JSON formatted list of all in-app products with their details.
+    """
+    service = _get_service()
+    package_name = _get_package_name()
+
+    result = service.monetization().onetimeproducts().list(
+        packageName=package_name,
+    ).execute()
+
+    products = result.get("onetimeProducts", [])
+
+    if not products:
+        return "No in-app products found."
+
+    output = [f"Found {len(products)} in-app product(s):\n"]
+
+    for product in products:
+        product_id = product.get("productId", "unknown")
+        listings = product.get("listings", [])
+        title = "No title"
+        for listing in listings:
+            if listing.get("languageCode") == "en-US":
+                title = listing.get("title", title)
+                break
+        if title == "No title" and listings:
+            title = listings[0].get("title", title)
+
+        # Get purchase options for status
+        options = product.get("purchaseOptions", [])
+        status = "UNKNOWN"
+        price_info = ""
+        for opt in options:
+            if "state" in opt:
+                status = opt["state"]
+            configs = opt.get("regionalPricingAndAvailabilityConfigs", [])
+            for cfg in configs:
+                if cfg.get("regionCode") == "US":
+                    price = cfg.get("price", {})
+                    units = price.get("units", "0")
+                    nanos = price.get("nanos", 0)
+                    price_val = int(units) + nanos / 1_000_000_000
+                    price_info = f"${price_val:.2f} USD"
+                    break
+
+        output.append(f"- {product_id}: {title} ({price_info}) [{status}]")
+
+    return "\n".join(output)
+
+
+@mcp.tool()
+def list_subscriptions() -> str:
+    """List all subscription products for the app.
+
+    Returns:
+        JSON formatted list of all subscription products.
+    """
+    service = _get_service()
+    package_name = _get_package_name()
+
+    result = service.monetization().subscriptions().list(
+        packageName=package_name,
+    ).execute()
+
+    subscriptions = result.get("subscriptions", [])
+
+    if not subscriptions:
+        return "No subscription products found."
+
+    output = [f"Found {len(subscriptions)} subscription(s):\n"]
+
+    for sub in subscriptions:
+        product_id = sub.get("productId", "unknown")
+        listings = sub.get("listings", [])
+        title = "No title"
+        for listing in listings:
+            if listing.get("languageCode") == "en-US":
+                title = listing.get("title", title)
+                break
+
+        output.append(f"- {product_id}: {title}")
+
+    return "\n".join(output)
+
+
+@mcp.tool()
+def get_app_info() -> str:
+    """Get basic app information from Google Play.
+
+    Returns:
+        App details including current version and track information.
+    """
+    service = _get_service()
+    package_name = _get_package_name()
+
+    # Create a read-only edit to query app info
+    edit = service.edits().insert(packageName=package_name, body={}).execute()
+    edit_id = edit["id"]
+
+    try:
+        # Get track info
+        tracks_result = service.edits().tracks().list(
+            packageName=package_name,
+            editId=edit_id,
+        ).execute()
+
+        output = [f"Package: {package_name}\n", "Tracks:"]
+
+        for track in tracks_result.get("tracks", []):
+            track_name = track.get("track", "unknown")
+            releases = track.get("releases", [])
+            if releases:
+                latest = releases[0]
+                version_codes = latest.get("versionCodes", [])
+                status = latest.get("status", "unknown")
+                output.append(
+                    f"  - {track_name}: version {version_codes}, status: {status}"
+                )
+            else:
+                output.append(f"  - {track_name}: no releases")
+
+        return "\n".join(output)
+
+    finally:
+        # Delete the edit
+        try:
+            service.edits().delete(packageName=package_name, editId=edit_id).execute()
+        except Exception:
+            pass
+
+
+@mcp.tool()
+def batch_create_inapp_products(products_json: str) -> str:
+    """Create multiple in-app products from a JSON array.
+
+    Each product in the array should have: sku, title_ko, title_en,
+    description_ko, description_en, price_usd.
+
+    IMPORTANT: The app must have BILLING permission and Play Billing Library
+    in an uploaded bundle before products can be created.
+
+    Args:
+        products_json: JSON array of product definitions.
+            Example: [
+              {"sku": "gems_12", "title_ko": "보석 12개", "title_en": "12 Gems",
+               "description_ko": "보석 12개", "description_en": "Get 12 gems",
+               "price_usd": 0.99},
+              ...
+            ]
+
+    Returns:
+        Summary of results for each product.
+    """
+    products = json.loads(products_json)
+    results = []
+
+    for i, product in enumerate(products, 1):
+        try:
+            # Call the single product creation function directly
+            service = _get_service()
+            package_name = _get_package_name()
+
+            sku = product["sku"]
+            price_usd = product["price_usd"]
+            price_micros = int(price_usd * 1_000_000)
+
+            converted = _convert_region_prices(service, package_name, price_micros)
+            regions_version = converted["regionVersion"]["version"]
+
+            regional_configs = []
+            for region_code, price_data in converted["convertedRegionPrices"].items():
+                price = price_data["price"]
+                regional_configs.append({
+                    "regionCode": region_code,
+                    "price": {
+                        "currencyCode": price["currencyCode"],
+                        "units": price.get("units", "0"),
+                        "nanos": price.get("nanos", 0),
+                    },
+                    "availability": "AVAILABLE",
+                })
+
+            other = converted.get("convertedOtherRegionsPrice", {})
+            new_regions_config = {
+                "availability": "AVAILABLE",
+                "usdPrice": other.get("usdPrice"),
+                "eurPrice": other.get("eurPrice"),
+            }
+
+            listings = [
+                {"languageCode": "ko-KR", "title": product["title_ko"], "description": product["description_ko"]},
+                {"languageCode": "en-US", "title": product["title_en"], "description": product["description_en"]},
+            ]
+
+            purchase_option_id = sku.replace("_", "-") + "-default"
+
+            body = {
+                "packageName": package_name,
+                "productId": sku,
+                "listings": listings,
+                "purchaseOptions": [{
+                    "purchaseOptionId": purchase_option_id,
+                    "buyOption": {"legacyCompatible": True},
+                    "regionalPricingAndAvailabilityConfigs": regional_configs,
+                    "newRegionsConfig": new_regions_config,
+                }],
+            }
+
+            request = service.monetization().onetimeproducts().patch(
+                packageName=package_name,
+                productId=sku,
+                body=body,
+                allowMissing=True,
+                updateMask="listings,purchaseOptions",
+            )
+            sep = "&" if "?" in request.uri else "?"
+            request.uri += f"{sep}regionsVersion.version={regions_version}"
+            request.execute()
+
+            results.append(f"[{i}/{len(products)}] OK: {sku} (${price_usd:.2f})")
+
+        except Exception as e:
+            results.append(f"[{i}/{len(products)}] FAIL: {product.get('sku', 'unknown')} - {e}")
+
+    return "\n".join(results)
+
+
+@mcp.tool()
+def batch_activate_inapp_products(skus_json: str) -> str:
+    """Activate multiple in-app products.
+
+    Args:
+        skus_json: JSON array of product IDs to activate.
+            Example: ["gems_12", "gems_66", "gems_136"]
+
+    Returns:
+        Summary of results for each product.
+    """
+    skus = json.loads(skus_json)
+    service = _get_service()
+    package_name = _get_package_name()
+    results = []
+
+    for i, sku in enumerate(skus, 1):
+        try:
+            purchase_option_id = sku.replace("_", "-") + "-default"
+
+            service.monetization().onetimeproducts().purchaseOptions().batchUpdateStates(
+                packageName=package_name,
+                productId=sku,
+                body={
+                    "requests": [{
+                        "activatePurchaseOptionRequest": {
+                            "packageName": package_name,
+                            "productId": sku,
+                            "purchaseOptionId": purchase_option_id,
+                        }
+                    }]
+                },
+            ).execute()
+
+            results.append(f"[{i}/{len(skus)}] OK: {sku} activated")
+
+        except Exception as e:
+            results.append(f"[{i}/{len(skus)}] FAIL: {sku} - {e}")
+
+    return "\n".join(results)
+
+
+if __name__ == "__main__":
+    mcp.run()
