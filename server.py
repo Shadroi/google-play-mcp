@@ -1,10 +1,25 @@
 """Google Play Developer API MCP Server.
 
-Provides tools for managing Google Play app deployment and in-app products:
+Provides tools for managing Google Play app deployment, store listings, and in-app products:
+
+Deployment:
 - deploy_internal: Upload AAB and deploy to internal testing track
+- get_app_info: Get app track information
+
+Store Listing:
+- get_store_listing: Get current store listing (title, descriptions)
+- update_store_listing: Update store listing text
+- upload_store_image: Upload icon, feature graphic, or screenshots
+- list_store_images: List uploaded images
+- delete_store_image: Delete an uploaded image
+
+In-App Products:
 - create_inapp_product: Create or update an in-app product
 - activate_inapp_product: Activate a draft in-app product
+- deactivate_inapp_product: Deactivate an in-app product
 - list_inapp_products: List all in-app products
+- batch_create_inapp_products: Create multiple products at once
+- batch_activate_inapp_products: Activate multiple products at once
 - list_subscriptions: List all subscription products
 """
 
@@ -554,6 +569,270 @@ def batch_create_inapp_products(products_json: str) -> str:
             results.append(f"[{i}/{len(products)}] FAIL: {product.get('sku', 'unknown')} - {e}")
 
     return "\n".join(results)
+
+
+@mcp.tool()
+def get_store_listing(language: str = "ko-KR") -> str:
+    """Get current store listing for the app.
+
+    Args:
+        language: Language code (e.g., "ko-KR", "en-US"). Default is "ko-KR".
+
+    Returns:
+        Current store listing information.
+    """
+    service = _get_service()
+    package_name = _get_package_name()
+
+    edit = service.edits().insert(packageName=package_name, body={}).execute()
+    edit_id = edit["id"]
+
+    try:
+        listing = service.edits().listings().get(
+            packageName=package_name,
+            editId=edit_id,
+            language=language,
+        ).execute()
+
+        return (
+            f"Store Listing ({language}):\n"
+            f"  Title: {listing.get('title', 'N/A')}\n"
+            f"  Short Description: {listing.get('shortDescription', 'N/A')}\n"
+            f"  Full Description: {listing.get('fullDescription', 'N/A')}"
+        )
+
+    except Exception as e:
+        if "404" in str(e):
+            return f"No store listing found for language: {language}"
+        raise e
+
+    finally:
+        try:
+            service.edits().delete(packageName=package_name, editId=edit_id).execute()
+        except Exception:
+            pass
+
+
+@mcp.tool()
+def update_store_listing(
+    language: str,
+    title: str = "",
+    short_description: str = "",
+    full_description: str = "",
+) -> str:
+    """Update store listing for the app.
+
+    Args:
+        language: Language code (e.g., "ko-KR", "en-US").
+        title: App title (max 30 characters). Leave empty to keep current.
+        short_description: Short description (max 80 characters). Leave empty to keep current.
+        full_description: Full description (max 4000 characters). Leave empty to keep current.
+
+    Returns:
+        A message indicating success.
+    """
+    service = _get_service()
+    package_name = _get_package_name()
+
+    edit = service.edits().insert(packageName=package_name, body={}).execute()
+    edit_id = edit["id"]
+
+    try:
+        # Get current listing first
+        try:
+            current = service.edits().listings().get(
+                packageName=package_name,
+                editId=edit_id,
+                language=language,
+            ).execute()
+        except Exception:
+            current = {}
+
+        # Build update body, keeping current values if not provided
+        body = {
+            "language": language,
+            "title": title if title else current.get("title", ""),
+            "shortDescription": short_description if short_description else current.get("shortDescription", ""),
+            "fullDescription": full_description if full_description else current.get("fullDescription", ""),
+        }
+
+        service.edits().listings().update(
+            packageName=package_name,
+            editId=edit_id,
+            language=language,
+            body=body,
+        ).execute()
+
+        # Commit the edit
+        service.edits().commit(packageName=package_name, editId=edit_id).execute()
+
+        return (
+            f"Successfully updated store listing for {language}.\n"
+            f"  Title: {body['title']}\n"
+            f"  Short Description: {body['shortDescription']}\n"
+            f"  Full Description: {body['fullDescription'][:100]}..."
+        )
+
+    except Exception as e:
+        try:
+            service.edits().delete(packageName=package_name, editId=edit_id).execute()
+        except Exception:
+            pass
+        raise e
+
+
+@mcp.tool()
+def upload_store_image(
+    image_path: str,
+    image_type: str,
+    language: str = "ko-KR",
+) -> str:
+    """Upload an image to the store listing.
+
+    Args:
+        image_path: Path to the image file (PNG or JPEG).
+        image_type: Type of image. One of:
+            - "icon": App icon (512x512 PNG)
+            - "featureGraphic": Feature graphic (1024x500)
+            - "phoneScreenshots": Phone screenshot
+            - "sevenInchScreenshots": 7-inch tablet screenshot
+            - "tenInchScreenshots": 10-inch tablet screenshot
+            - "tvBanner": TV banner
+            - "tvScreenshots": TV screenshot
+            - "wearScreenshots": Wear OS screenshot
+        language: Language code for screenshots (not used for icon/featureGraphic).
+
+    Returns:
+        A message indicating success with image details.
+    """
+    service = _get_service()
+    package_name = _get_package_name()
+
+    if not os.path.exists(image_path):
+        raise ValueError(f"Image file not found: {image_path}")
+
+    edit = service.edits().insert(packageName=package_name, body={}).execute()
+    edit_id = edit["id"]
+
+    try:
+        # Determine mime type
+        ext = os.path.splitext(image_path)[1].lower()
+        if ext == ".png":
+            mime_type = "image/png"
+        elif ext in [".jpg", ".jpeg"]:
+            mime_type = "image/jpeg"
+        else:
+            raise ValueError(f"Unsupported image format: {ext}. Use PNG or JPEG.")
+
+        media = MediaFileUpload(image_path, mimetype=mime_type)
+
+        result = service.edits().images().upload(
+            packageName=package_name,
+            editId=edit_id,
+            language=language,
+            imageType=image_type,
+            media_body=media,
+        ).execute()
+
+        # Commit the edit
+        service.edits().commit(packageName=package_name, editId=edit_id).execute()
+
+        image_info = result.get("image", {})
+        return (
+            f"Successfully uploaded {image_type} for {language}.\n"
+            f"  ID: {image_info.get('id', 'N/A')}\n"
+            f"  SHA256: {image_info.get('sha256', 'N/A')[:16]}..."
+        )
+
+    except Exception as e:
+        try:
+            service.edits().delete(packageName=package_name, editId=edit_id).execute()
+        except Exception:
+            pass
+        raise e
+
+
+@mcp.tool()
+def list_store_images(language: str = "ko-KR", image_type: str = "phoneScreenshots") -> str:
+    """List uploaded images for the store listing.
+
+    Args:
+        language: Language code (e.g., "ko-KR", "en-US").
+        image_type: Type of image to list (e.g., "phoneScreenshots", "icon").
+
+    Returns:
+        List of uploaded images.
+    """
+    service = _get_service()
+    package_name = _get_package_name()
+
+    edit = service.edits().insert(packageName=package_name, body={}).execute()
+    edit_id = edit["id"]
+
+    try:
+        result = service.edits().images().list(
+            packageName=package_name,
+            editId=edit_id,
+            language=language,
+            imageType=image_type,
+        ).execute()
+
+        images = result.get("images", [])
+
+        if not images:
+            return f"No {image_type} images found for {language}."
+
+        output = [f"Found {len(images)} {image_type} image(s) for {language}:"]
+        for img in images:
+            output.append(f"  - ID: {img.get('id', 'N/A')}, SHA256: {img.get('sha256', 'N/A')[:16]}...")
+
+        return "\n".join(output)
+
+    finally:
+        try:
+            service.edits().delete(packageName=package_name, editId=edit_id).execute()
+        except Exception:
+            pass
+
+
+@mcp.tool()
+def delete_store_image(image_id: str, language: str, image_type: str) -> str:
+    """Delete an image from the store listing.
+
+    Args:
+        image_id: ID of the image to delete.
+        language: Language code (e.g., "ko-KR", "en-US").
+        image_type: Type of image (e.g., "phoneScreenshots", "icon").
+
+    Returns:
+        A message indicating success.
+    """
+    service = _get_service()
+    package_name = _get_package_name()
+
+    edit = service.edits().insert(packageName=package_name, body={}).execute()
+    edit_id = edit["id"]
+
+    try:
+        service.edits().images().delete(
+            packageName=package_name,
+            editId=edit_id,
+            language=language,
+            imageType=image_type,
+            imageId=image_id,
+        ).execute()
+
+        # Commit the edit
+        service.edits().commit(packageName=package_name, editId=edit_id).execute()
+
+        return f"Successfully deleted {image_type} image {image_id} for {language}."
+
+    except Exception as e:
+        try:
+            service.edits().delete(packageName=package_name, editId=edit_id).execute()
+        except Exception:
+            pass
+        raise e
 
 
 @mcp.tool()
