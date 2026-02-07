@@ -9,9 +9,11 @@ Deployment:
 Store Listing:
 - get_store_listing: Get current store listing (title, descriptions)
 - update_store_listing: Update store listing text
-- upload_store_image: Upload icon, feature graphic, or screenshots
+- upload_store_image: Upload a single image (icon, feature graphic, screenshot)
+- batch_upload_store_images: Upload all images from a directory in one edit
 - list_store_images: List uploaded images
-- delete_store_image: Delete an uploaded image
+- delete_store_image: Delete a single image
+- delete_all_store_images: Delete all images of a given type
 
 In-App Products:
 - create_inapp_product: Create or update an in-app product
@@ -85,6 +87,40 @@ def _convert_region_prices(service, package_name: str, price_usd_micros: int) ->
     ).execute()
 
     return result
+
+
+def _commit_edit(service, package_name: str, edit_id: str):
+    """Commit an edit, handling draft apps that require a track update.
+
+    Draft apps on Google Play require a track release with status "draft"
+    to be present in the same edit when committing. This function always
+    re-applies the internal track with draft status before committing.
+    """
+    # For draft apps: always re-apply internal track with draft status
+    track = service.edits().tracks().get(
+        packageName=package_name,
+        editId=edit_id,
+        track="internal",
+    ).execute()
+
+    releases = track.get("releases", [])
+    if releases:
+        # Only keep the latest release as draft (API allows only one draft)
+        latest = releases[0]
+        latest["status"] = "draft"
+        releases = [latest]
+    else:
+        releases = [{"status": "draft"}]
+
+    service.edits().tracks().update(
+        packageName=package_name,
+        editId=edit_id,
+        track="internal",
+        body={"track": "internal", "releases": releases},
+    ).execute()
+
+    # Now commit with the track update included
+    service.edits().commit(packageName=package_name, editId=edit_id).execute()
 
 
 @mcp.tool()
@@ -165,6 +201,97 @@ def deploy_internal(
 
     except Exception as e:
         # Delete edit on failure
+        try:
+            service.edits().delete(packageName=package_name, editId=edit_id).execute()
+        except Exception:
+            pass
+        raise e
+
+
+@mcp.tool()
+def deploy_track(
+    aab_path: str,
+    track: str = "internal",
+    release_notes_ko: str = "",
+    release_notes_en: str = "",
+    status: str = "draft",
+) -> str:
+    """Deploy an Android App Bundle to any testing track.
+
+    Args:
+        aab_path: Path to the .aab file to upload.
+        track: Target track - "internal", "alpha" (closed testing),
+               "beta" (open testing), or "production".
+        release_notes_ko: Release notes in Korean (optional).
+        release_notes_en: Release notes in English (optional).
+        status: Release status - "draft" for unpublished apps, "completed" for
+                published apps. Default is "draft".
+
+    Returns:
+        A message indicating success with version code and edit ID.
+    """
+    valid_tracks = ("internal", "alpha", "beta", "production")
+    if track not in valid_tracks:
+        raise ValueError(f"Invalid track: {track}. Must be one of {valid_tracks}")
+
+    service = _get_service()
+    package_name = _get_package_name()
+
+    if not os.path.exists(aab_path):
+        raise ValueError(f"AAB file not found: {aab_path}")
+
+    track_display = {
+        "internal": "internal testing",
+        "alpha": "closed testing",
+        "beta": "open testing",
+        "production": "production",
+    }
+
+    edit = service.edits().insert(packageName=package_name, body={}).execute()
+    edit_id = edit["id"]
+
+    try:
+        media = MediaFileUpload(aab_path, mimetype="application/octet-stream")
+        bundle = service.edits().bundles().upload(
+            packageName=package_name,
+            editId=edit_id,
+            media_body=media,
+        ).execute()
+        version_code = bundle["versionCode"]
+
+        release_notes = []
+        if release_notes_ko:
+            release_notes.append({"language": "ko-KR", "text": release_notes_ko})
+        if release_notes_en:
+            release_notes.append({"language": "en-US", "text": release_notes_en})
+
+        track_body = {
+            "track": track,
+            "releases": [{
+                "versionCodes": [str(version_code)],
+                "status": status,
+            }],
+        }
+        if release_notes:
+            track_body["releases"][0]["releaseNotes"] = release_notes
+
+        service.edits().tracks().update(
+            packageName=package_name,
+            editId=edit_id,
+            track=track,
+            body=track_body,
+        ).execute()
+
+        service.edits().commit(packageName=package_name, editId=edit_id).execute()
+
+        return (
+            f"Successfully deployed to {track_display[track]} track.\n"
+            f"Version code: {version_code}\n"
+            f"Status: {status}\n"
+            f"Edit ID: {edit_id}"
+        )
+
+    except Exception as e:
         try:
             service.edits().delete(packageName=package_name, editId=edit_id).execute()
         except Exception:
@@ -663,8 +790,8 @@ def update_store_listing(
             body=body,
         ).execute()
 
-        # Commit the edit
-        service.edits().commit(packageName=package_name, editId=edit_id).execute()
+        # Commit the edit (handles draft app requirements)
+        _commit_edit(service, package_name, edit_id)
 
         return (
             f"Successfully updated store listing for {language}.\n"
@@ -692,15 +819,21 @@ def upload_store_image(
     Args:
         image_path: Path to the image file (PNG or JPEG).
         image_type: Type of image. One of:
-            - "icon": App icon (512x512 PNG)
-            - "featureGraphic": Feature graphic (1024x500)
-            - "phoneScreenshots": Phone screenshot
-            - "sevenInchScreenshots": 7-inch tablet screenshot
-            - "tenInchScreenshots": 10-inch tablet screenshot
-            - "tvBanner": TV banner
+            - "icon": App icon (512x512 PNG, 1 required)
+            - "featureGraphic": Feature graphic (1024x500, 1 required)
+            - "phoneScreenshots": Phone screenshot (8 required, min 320px,
+              max 3840px per side, aspect ratio max 2:1,
+              recommended 1080x2340 portrait)
+            - "sevenInchScreenshots": 7-inch tablet screenshot (up to 8,
+              recommended 1200x1920 portrait)
+            - "tenInchScreenshots": 10-inch tablet screenshot (up to 8,
+              recommended 1600x2560 portrait)
+            - "tvBanner": TV banner (1280x720)
             - "tvScreenshots": TV screenshot
             - "wearScreenshots": Wear OS screenshot
-        language: Language code for screenshots (not used for icon/featureGraphic).
+        language: Language code (e.g., "ko-KR", "en-US"). Each language
+            needs its own set of screenshots. Icon and featureGraphic are
+            also per-language.
 
     Returns:
         A message indicating success with image details.
@@ -734,8 +867,8 @@ def upload_store_image(
             media_body=media,
         ).execute()
 
-        # Commit the edit
-        service.edits().commit(packageName=package_name, editId=edit_id).execute()
+        # Commit the edit (handles draft app requirements)
+        _commit_edit(service, package_name, edit_id)
 
         image_info = result.get("image", {})
         return (
@@ -822,10 +955,174 @@ def delete_store_image(image_id: str, language: str, image_type: str) -> str:
             imageId=image_id,
         ).execute()
 
-        # Commit the edit
-        service.edits().commit(packageName=package_name, editId=edit_id).execute()
+        # Commit the edit (handles draft app requirements)
+        _commit_edit(service, package_name, edit_id)
 
         return f"Successfully deleted {image_type} image {image_id} for {language}."
+
+    except Exception as e:
+        try:
+            service.edits().delete(packageName=package_name, editId=edit_id).execute()
+        except Exception:
+            pass
+        raise e
+
+
+@mcp.tool()
+def batch_upload_store_images(
+    directory: str,
+    image_type: str,
+    language: str = "ko-KR",
+    clear_existing: bool = False,
+) -> str:
+    """Upload all images from a directory to the store listing in a single edit.
+
+    Much faster than uploading one by one since it uses a single API edit
+    transaction for all images.
+
+    Args:
+        directory: Path to the directory containing image files (PNG or JPEG).
+            Files are uploaded in alphabetical order.
+        image_type: Type of image. One of:
+            - "icon": App icon (512x512 PNG, only 1 allowed)
+            - "featureGraphic": Feature graphic (1024x500, only 1 allowed)
+            - "phoneScreenshots": Phone screenshots (2-8 images, min 320px,
+              max 3840px, aspect ratio max 2:1)
+            - "sevenInchScreenshots": 7-inch tablet screenshots (up to 8,
+              recommended 1200x1920 portrait)
+            - "tenInchScreenshots": 10-inch tablet screenshots (up to 8,
+              recommended 1600x2560 portrait)
+            - "tvBanner": TV banner (1280x720)
+            - "tvScreenshots": TV screenshots
+            - "wearScreenshots": Wear OS screenshots
+        language: Language code (e.g., "ko-KR", "en-US"). Each language
+            needs its own set of screenshots.
+        clear_existing: If True, delete all existing images of this type
+            before uploading. Default is False.
+
+    Returns:
+        Summary of upload results.
+    """
+    import glob as glob_mod
+
+    service = _get_service()
+    package_name = _get_package_name()
+
+    if not os.path.isdir(directory):
+        raise ValueError(f"Directory not found: {directory}")
+
+    # Find image files
+    files = sorted(
+        f for f in glob_mod.glob(os.path.join(directory, "*"))
+        if os.path.splitext(f)[1].lower() in (".png", ".jpg", ".jpeg")
+    )
+
+    if not files:
+        raise ValueError(f"No PNG/JPEG images found in: {directory}")
+
+    edit = service.edits().insert(packageName=package_name, body={}).execute()
+    edit_id = edit["id"]
+
+    try:
+        results = []
+
+        # Optionally clear existing images
+        if clear_existing:
+            try:
+                existing = service.edits().images().list(
+                    packageName=package_name,
+                    editId=edit_id,
+                    language=language,
+                    imageType=image_type,
+                ).execute()
+                for img in existing.get("images", []):
+                    service.edits().images().delete(
+                        packageName=package_name,
+                        editId=edit_id,
+                        language=language,
+                        imageType=image_type,
+                        imageId=img["id"],
+                    ).execute()
+                    results.append(f"Deleted existing: {img['id']}")
+            except Exception:
+                pass
+
+        # Upload all images
+        for i, filepath in enumerate(files, 1):
+            ext = os.path.splitext(filepath)[1].lower()
+            mime = "image/png" if ext == ".png" else "image/jpeg"
+            media = MediaFileUpload(filepath, mimetype=mime)
+
+            result = service.edits().images().upload(
+                packageName=package_name,
+                editId=edit_id,
+                language=language,
+                imageType=image_type,
+                media_body=media,
+            ).execute()
+
+            img_id = result.get("image", {}).get("id", "N/A")
+            filename = os.path.basename(filepath)
+            results.append(f"[{i}/{len(files)}] Uploaded: {filename} (ID: {img_id})")
+
+        # Commit
+        _commit_edit(service, package_name, edit_id)
+
+        return "\n".join([
+            f"Successfully uploaded {len(files)} {image_type} for {language}.",
+            *results,
+        ])
+
+    except Exception as e:
+        try:
+            service.edits().delete(packageName=package_name, editId=edit_id).execute()
+        except Exception:
+            pass
+        raise e
+
+
+@mcp.tool()
+def delete_all_store_images(language: str, image_type: str) -> str:
+    """Delete all images of a given type from the store listing.
+
+    Args:
+        language: Language code (e.g., "ko-KR", "en-US").
+        image_type: Type of image (e.g., "phoneScreenshots", "icon").
+
+    Returns:
+        A message indicating how many images were deleted.
+    """
+    service = _get_service()
+    package_name = _get_package_name()
+
+    edit = service.edits().insert(packageName=package_name, body={}).execute()
+    edit_id = edit["id"]
+
+    try:
+        result = service.edits().images().list(
+            packageName=package_name,
+            editId=edit_id,
+            language=language,
+            imageType=image_type,
+        ).execute()
+
+        images = result.get("images", [])
+        if not images:
+            service.edits().delete(packageName=package_name, editId=edit_id).execute()
+            return f"No {image_type} images found for {language}."
+
+        for img in images:
+            service.edits().images().delete(
+                packageName=package_name,
+                editId=edit_id,
+                language=language,
+                imageType=image_type,
+                imageId=img["id"],
+            ).execute()
+
+        _commit_edit(service, package_name, edit_id)
+
+        return f"Successfully deleted {len(images)} {image_type} image(s) for {language}."
 
     except Exception as e:
         try:
