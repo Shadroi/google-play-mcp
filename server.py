@@ -300,6 +300,91 @@ def deploy_track(
 
 
 @mcp.tool()
+def deploy_production(
+    aab_path: str,
+    release_notes_ko: str = "",
+    release_notes_en: str = "",
+    status: str = "completed",
+) -> str:
+    """Deploy an Android App Bundle to the PRODUCTION track.
+
+    CRITICAL: You MUST ask for explicit user confirmation before calling this
+    tool. Production deployment publishes the app to ALL users on Google Play
+    and is difficult to reverse. Always show the user the version, release
+    notes, and status before proceeding, and wait for their approval.
+
+    Args:
+        aab_path: Path to the .aab file to upload.
+        release_notes_ko: Release notes in Korean (optional).
+        release_notes_en: Release notes in English (optional).
+        status: Release status - "completed" to publish immediately,
+                "halted" to pause rollout, "inProgress" for staged rollout.
+                Default is "completed".
+
+    Returns:
+        A message indicating success with version code and edit ID.
+    """
+    service = _get_service()
+    package_name = _get_package_name()
+
+    if not os.path.exists(aab_path):
+        raise ValueError(f"AAB file not found: {aab_path}")
+
+    edit = service.edits().insert(packageName=package_name, body={}).execute()
+    edit_id = edit["id"]
+
+    try:
+        media = MediaFileUpload(aab_path, mimetype="application/octet-stream")
+        bundle = service.edits().bundles().upload(
+            packageName=package_name,
+            editId=edit_id,
+            media_body=media,
+        ).execute()
+        version_code = bundle["versionCode"]
+
+        release_notes = []
+        if release_notes_ko:
+            release_notes.append({"language": "ko-KR", "text": release_notes_ko})
+        if release_notes_en:
+            release_notes.append({"language": "en-US", "text": release_notes_en})
+
+        release = {
+            "versionCodes": [str(version_code)],
+            "status": status,
+        }
+        if release_notes:
+            release["releaseNotes"] = release_notes
+
+        track_body = {
+            "track": "production",
+            "releases": [release],
+        }
+
+        service.edits().tracks().update(
+            packageName=package_name,
+            editId=edit_id,
+            track="production",
+            body=track_body,
+        ).execute()
+
+        service.edits().commit(packageName=package_name, editId=edit_id).execute()
+
+        return (
+            f"Successfully deployed to PRODUCTION track.\n"
+            f"Version code: {version_code}\n"
+            f"Status: {status}\n"
+            f"Edit ID: {edit_id}"
+        )
+
+    except Exception as e:
+        try:
+            service.edits().delete(packageName=package_name, editId=edit_id).execute()
+        except Exception:
+            pass
+        raise e
+
+
+@mcp.tool()
 def create_inapp_product(
     sku: str,
     title_ko: str,
