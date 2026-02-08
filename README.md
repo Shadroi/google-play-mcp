@@ -5,9 +5,11 @@ A Model Context Protocol (MCP) server for managing Google Play app deployment an
 ## Features
 
 ### App Deployment
+
 - **deploy_internal**: Upload AAB and deploy to internal testing track
 
 ### In-App Products
+
 - **create_inapp_product**: Create or update a single in-app product
 - **batch_create_inapp_products**: Create multiple products at once
 - **activate_inapp_product**: Activate a draft product
@@ -17,6 +19,7 @@ A Model Context Protocol (MCP) server for managing Google Play app deployment an
 - **list_subscriptions**: List all subscription products
 
 ### App Info
+
 - **get_app_info**: Get app track and version information
 
 ## Requirements
@@ -25,65 +28,107 @@ A Model Context Protocol (MCP) server for managing Google Play app deployment an
 - Google Cloud service account with Google Play Developer API access
 - App registered in Google Play Console
 
-## Installation
+## Installation & Usage
 
-1. Clone this repository:
+You can use this MCP server directly with `npx` without installing it manually.
+
+### Quick Start (npx)
+
 ```bash
-git clone https://github.com/yourusername/google-play-mcp.git
-cd google-play-mcp
+# Configure your API key
+npx google-play-mcp init-key
+
+# For Korean instructions (한국어 안내)
+npx google-play-mcp init-key --lang ko
+
+# Start the server
+npx google-play-mcp start
 ```
 
-2. Create and activate a virtual environment:
+### Installation (Global)
+
+If you prefer to install it globally (from npm):
+
 ```bash
-python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+npm install -g google-play-mcp
 ```
 
-3. Install dependencies:
+### Installation (Local Dev)
+
+To install from the cloned repository:
+
 ```bash
-pip install -r requirements.txt
+npm install -g .
 ```
 
-4. Create a `.env` file:
+Then you can run:
+
 ```bash
-cp .env.example .env
-# Edit .env with your settings
+google-play-mcp init-key
+google-play-mcp start
 ```
 
-## Configuration
+## Configuration (Antigravity & Claude Desktop)
 
-### Service Account Setup
-
-1. Go to [Google Cloud Console](https://console.cloud.google.com/)
-2. Create a new project or select an existing one
-3. Enable the **Google Play Android Developer API**
-4. Go to **IAM & Admin** → **Service Accounts**
-5. Create a new service account
-6. Create and download a JSON key file
-7. Go to [Google Play Console](https://play.google.com/console)
-8. Navigate to **Settings** → **API access**
-9. Link your Google Cloud project
-10. Grant access to the service account with appropriate permissions
-
-### Environment Variables
-
-Create a `.env` file in the project root:
-
-```
-GOOGLE_PLAY_KEY_FILE=/path/to/your-service-account-key.json
-GOOGLE_PLAY_PACKAGE_NAME=com.yourcompany.yourapp
-```
-
-## Usage with Claude Code
-
-Add to your `.mcp.json` configuration:
+To use this MCP server, add the following configuration to your MCP client (e.g., `claude_desktop_config.json` or Antigravity settings):
 
 ```json
 {
   "mcpServers": {
     "google-play": {
-      "command": "/path/to/google-play-mcp/.venv/bin/python",
-      "args": ["/path/to/google-play-mcp/server.py"]
+      "command": "google-play-mcp",
+      "args": ["start"],
+      "env": {
+        "GOOGLE_PLAY_KEY_FILE": "/absolute/path/to/your-key.json",
+        "GOOGLE_PLAY_PACKAGE_NAME": "com.yourcompany.yourapp"
+      }
+    }
+  }
+}
+```
+
+> **Note:** If you haven't run `init-key` or don't have a `.env` file, you can pass environment variables directly in the configuration as shown above. If you have a `.env` file in the working directory, the server will load it automatically.
+
+1. Login to npm:
+
+```bash
+npm login
+```
+
+1. Publish the package:
+
+```bash
+npm publish
+```
+
+## Configuration
+
+The `npm run init-key` script will automatically create a `.env` file with your configuration:
+
+```
+GOOGLE_PLAY_KEY_FILE=/absolute/path/to/your-key.json
+GOOGLE_PLAY_PACKAGE_NAME=com.yourcompany.yourapp
+```
+
+## Usage
+
+To start the server manually:
+
+```bash
+npm start
+```
+
+### Usage with Claude Desktop
+
+Add to your `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "google-play": {
+      "command": "npm",
+      "args": ["start"],
+      "cwd": "/absolute/path/to/google-play-mcp"
     }
   }
 }

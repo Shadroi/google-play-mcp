@@ -48,3 +48,4 @@ Thumbs.db
 # App bundles
 *.aab
 *.apk
+!locales.json

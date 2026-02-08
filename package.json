@@ -1,0 +1,28 @@
+{
+    "name": "google-play-mcp",
+    "version": "1.0.0",
+    "description": "MCP server for Google Play Developer API",
+    "scripts": {
+        "start": "node bin/cli.js start",
+        "init-key": "node bin/cli.js init-key"
+    },
+    "bin": {
+        "google-play-mcp": "./bin/cli.js"
+    },
+    "files": [
+        "server.py",
+        "setup_key.py",
+        "requirements.txt",
+        "bin/cli.js",
+        ".env.example",
+        "locales.json"
+    ],
+    "preferGlobal": true,
+    "keywords": [
+        "mcp",
+        "google-play",
+        "python"
+    ],
+    "author": "",
+    "license": "MIT"
+}
