@@ -22,6 +22,7 @@ In-App Products:
 - list_inapp_products: List all in-app products
 - batch_create_inapp_products: Create multiple products at once
 - batch_activate_inapp_products: Activate multiple products at once
+- create_subscription_product: Create or update a subscription product
 - list_subscriptions: List all subscription products
 """
 
@@ -639,6 +640,106 @@ def list_subscriptions() -> str:
         output.append(f"- {product_id}: {title}")
 
     return "\n".join(output)
+
+
+@mcp.tool()
+def create_subscription_product(
+    product_id: str,
+    base_plan_id: str,
+    title_ko: str,
+    title_en: str,
+    description_ko: str,
+    description_en: str,
+    price_usd: float,
+    billing_period: str = "P1M",
+) -> str:
+    """Create or update a subscription product with one auto-renewing base plan.
+
+    This uses the monetization subscriptions API and automatically converts USD
+    prices to regional prices.
+
+    Args:
+        product_id: Subscription product ID (e.g., "malto_plus_monthly").
+        base_plan_id: Base plan ID (e.g., "monthly").
+        title_ko: Korean title.
+        title_en: English title.
+        description_ko: Korean description.
+        description_en: English description.
+        price_usd: Base USD price (e.g. 4.99).
+        billing_period: ISO-8601 period (e.g., P1M, P1Y). Default P1M.
+
+    Returns:
+        Success message with subscription details.
+    """
+    service = _get_service()
+    package_name = _get_package_name()
+
+    if price_usd <= 0:
+        raise ValueError("price_usd must be greater than 0")
+
+    price_micros = int(price_usd * 1_000_000)
+    converted = _convert_region_prices(service, package_name, price_micros)
+    regions_version = converted["regionVersion"]["version"]
+
+    regional_configs = []
+    for region_code, price_data in converted["convertedRegionPrices"].items():
+        price = price_data["price"]
+        regional_configs.append({
+            "regionCode": region_code,
+            "newSubscriberAvailability": "AVAILABLE",
+            "price": {
+                "currencyCode": price["currencyCode"],
+                "units": price.get("units", "0"),
+                "nanos": price.get("nanos", 0),
+            },
+        })
+
+    body = {
+        "packageName": package_name,
+        "productId": product_id,
+        "listings": [
+            {
+                "languageCode": "ko-KR",
+                "title": title_ko,
+                "description": description_ko,
+            },
+            {
+                "languageCode": "en-US",
+                "title": title_en,
+                "description": description_en,
+            },
+        ],
+        "basePlans": [{
+            "basePlanId": base_plan_id,
+            "state": "ACTIVE",
+            "autoRenewingBasePlanType": {
+                "billingPeriodDuration": billing_period,
+                "gracePeriodDuration": "P3D",
+            },
+            "regionalConfigs": regional_configs,
+        }],
+    }
+
+    request = service.monetization().subscriptions().patch(
+        packageName=package_name,
+        productId=product_id,
+        body=body,
+        allowMissing=True,
+        updateMask="listings,basePlans",
+    )
+
+    sep = "&" if "?" in request.uri else "?"
+    request.uri += f"{sep}regionsVersion.version={regions_version}"
+    request.execute()
+
+    return (
+        f"Successfully created/updated subscription product.\n"
+        f"Product ID: {product_id}\n"
+        f"Base plan ID: {base_plan_id}\n"
+        f"Billing period: {billing_period}\n"
+        f"Price: ${price_usd:.2f} USD\n"
+        f"Regions: {len(regional_configs)}"
+    )
 
 
 @mcp.tool()

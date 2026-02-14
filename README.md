@@ -16,6 +16,7 @@ A Model Context Protocol (MCP) server for managing Google Play app deployment an
 - **batch_activate_inapp_products**: Activate multiple products
 - **deactivate_inapp_product**: Deactivate an active product
 - **list_inapp_products**: List all one-time products
+- **create_subscription_product**: Create or update a subscription product
 - **list_subscriptions**: List all subscription products
 
 ### App Info
@@ -88,6 +89,55 @@ To use this MCP server, add the following configuration to your MCP client (e.g.
 ```
 
 > **Note:** If you haven't run `init-key` or don't have a `.env` file, you can pass environment variables directly in the configuration as shown above. If you have a `.env` file in the working directory, the server will load it automatically.
+
+## Configuration (Codex)
+
+If your workspace layout is:
+
+```
+/Users/<you>/Foreign-Language-Battle/
+  └─ google-play-mcp/
+```
+
+you can run this MCP server from the cloned repository directory.
+
+1. Create `.env` inside `google-play-mcp`:
+
+```bash
+cd /Users/<you>/Foreign-Language-Battle/google-play-mcp
+cp .env.example .env
+# edit .env and set:
+# GOOGLE_PLAY_KEY_FILE=/absolute/path/to/service-account.json
+# GOOGLE_PLAY_PACKAGE_NAME=com.yourcompany.yourapp
+```
+
+2. Install dependencies:
+
+```bash
+cd /Users/<you>/Foreign-Language-Battle/google-play-mcp
+pip install -r requirements.txt
+```
+
+3. Add MCP server entry in Codex config (example):
+
+```json
+{
+  "mcpServers": {
+    "google-play": {
+      "command": "python3",
+      "args": ["server.py"],
+      "cwd": "/Users/<you>/Foreign-Language-Battle/google-play-mcp",
+      "env": {
+        "GOOGLE_PLAY_KEY_FILE": "/absolute/path/to/service-account.json",
+        "GOOGLE_PLAY_PACKAGE_NAME": "com.yourcompany.yourapp"
+      }
+    }
+  }
+}
+```
+
+4. Restart Codex (or reload MCP servers), then call tools such as
+`get_app_info`, `create_inapp_product`, and `create_subscription_product`.
 
 1. Login to npm:
 
@@ -167,6 +217,18 @@ Create an in-app product:
 
 ```json
 ["gems_12", "gems_66", "gems_136"]
+```
+
+### Create Subscription Product
+
+```
+Create a subscription product:
+- Product ID: malto_plus_monthly
+- Base Plan ID: monthly
+- Korean: 말투 플러스 월간 / 매일 보석을 지급하는 월간 구독
+- English: Malto Plus Monthly / Monthly subscription with daily gem rewards
+- Price: $4.99 USD
+- Billing Period: P1M
 ```
 
 ## Important Notes
