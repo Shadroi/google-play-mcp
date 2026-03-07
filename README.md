@@ -7,6 +7,8 @@ A Model Context Protocol (MCP) server for managing Google Play app deployment an
 ### App Deployment
 
 - **deploy_internal**: Upload AAB and deploy to internal testing track
+- **deploy_track**: Upload AAB and deploy to any supported track
+- **promote_track_release**: Promote an existing uploaded release between tracks without re-uploading an AAB
 
 ### In-App Products
 
@@ -190,6 +192,13 @@ Add to your `claude_desktop_config.json`:
 
 ```
 Deploy app-release.aab to internal testing with Korean and English release notes
+```
+
+### Promote Internal Release to Production
+
+```
+Promote the existing internal track release to production without uploading a new AAB.
+Set Korean release notes to 버그 핫픽스 and English release notes to Bug hotfix.
 ```
 
 ### Create In-App Product

@@ -4,6 +4,8 @@ Provides tools for managing Google Play app deployment, store listings, and in-a
 
 Deployment:
 - deploy_internal: Upload AAB and deploy to internal testing track
+- deploy_track: Upload AAB and deploy to a selected track
+- promote_track_release: Promote an existing uploaded release between tracks
 - get_app_info: Get app track information
 
 Store Listing:
@@ -41,6 +43,13 @@ load_dotenv(Path(__file__).parent / ".env")
 mcp = FastMCP("google-play")
 
 SCOPES = ["https://www.googleapis.com/auth/androidpublisher"]
+VALID_TRACKS = ("internal", "alpha", "beta", "production")
+TRACK_DISPLAY = {
+    "internal": "internal testing",
+    "alpha": "closed testing",
+    "beta": "open testing",
+    "production": "production",
+}
 
 
 def _get_service():
@@ -69,6 +78,84 @@ def _get_package_name() -> str:
             "Please set it to your app's package name (e.g., com.example.app)."
         )
     return package_name
+
+
+def _validate_track_name(track: str) -> str:
+    """Validate that the track is supported by the server."""
+    if track not in VALID_TRACKS:
+        raise ValueError(
+            f"Invalid track: {track}. Must be one of {VALID_TRACKS}"
+        )
+    return track
+
+
+def _build_release_notes(
+    release_notes_ko: str = "",
+    release_notes_en: str = "",
+) -> list[dict]:
+    """Build Google Play release-notes payload entries."""
+    release_notes = []
+    if release_notes_ko:
+        release_notes.append({"language": "ko-KR", "text": release_notes_ko})
+    if release_notes_en:
+        release_notes.append({"language": "en-US", "text": release_notes_en})
+    return release_notes
+
+
+def _parse_version_codes_json(version_codes_json: str = "") -> list[str] | None:
+    """Parse optional version-code JSON into stringified version codes."""
+    if not version_codes_json.strip():
+        return None
+
+    try:
+        version_codes = json.loads(version_codes_json)
+    except json.JSONDecodeError as error:
+        raise ValueError("version_codes_json must be valid JSON.") from error
+
+    if not isinstance(version_codes, list) or not version_codes:
+        raise ValueError("version_codes_json must be a non-empty JSON array.")
+
+    return [str(version_code) for version_code in version_codes]
+
+
+def _select_release_to_promote(
+    releases: list[dict], version_codes: list[str] | None
+) -> dict:
+    """Select the source-track release that should be promoted."""
+    if not releases:
+        raise ValueError("The source track has no releases to promote.")
+
+    if version_codes is None:
+        return releases[0]
+
+    requested_codes = set(version_codes)
+    for release in releases:
+        release_codes = {str(code) for code in release.get("versionCodes", [])}
+        if requested_codes.issubset(release_codes):
+            return release
+
+    raise ValueError(
+        "The requested version codes were not found on the source track."
+    )
+
+
+def _build_promoted_release(
+    source_release: dict, status: str, release_notes: list[dict]
+) -> dict:
+    """Build the target-track release body from a source release."""
+    promoted_release = {
+        "versionCodes": [
+            str(version_code)
+            for version_code in source_release.get("versionCodes", [])
+        ],
+        "status": status,
+    }
+
+    notes_to_use = release_notes or source_release.get("releaseNotes", [])
+    if notes_to_use:
+        promoted_release["releaseNotes"] = notes_to_use
+
+    return promoted_release
 
 
 def _convert_region_prices(service, package_name: str, price_usd_micros: int) -> dict:
@@ -167,11 +254,10 @@ def deploy_internal(
         version_code = bundle["versionCode"]
 
         # 3. Set track
-        release_notes = []
-        if release_notes_ko:
-            release_notes.append({"language": "ko-KR", "text": release_notes_ko})
-        if release_notes_en:
-            release_notes.append({"language": "en-US", "text": release_notes_en})
+        release_notes = _build_release_notes(
+            release_notes_ko=release_notes_ko,
+            release_notes_en=release_notes_en,
+        )
 
         track_body = {
             "track": "internal",
@@ -231,22 +317,13 @@ def deploy_track(
     Returns:
         A message indicating success with version code and edit ID.
     """
-    valid_tracks = ("internal", "alpha", "beta", "production")
-    if track not in valid_tracks:
-        raise ValueError(f"Invalid track: {track}. Must be one of {valid_tracks}")
+    _validate_track_name(track)
 
     service = _get_service()
     package_name = _get_package_name()
 
     if not os.path.exists(aab_path):
         raise ValueError(f"AAB file not found: {aab_path}")
-
-    track_display = {
-        "internal": "internal testing",
-        "alpha": "closed testing",
-        "beta": "open testing",
-        "production": "production",
-    }
 
     edit = service.edits().insert(packageName=package_name, body={}).execute()
     edit_id = edit["id"]
@@ -260,11 +337,10 @@ def deploy_track(
         ).execute()
         version_code = bundle["versionCode"]
 
-        release_notes = []
-        if release_notes_ko:
-            release_notes.append({"language": "ko-KR", "text": release_notes_ko})
-        if release_notes_en:
-            release_notes.append({"language": "en-US", "text": release_notes_en})
+        release_notes = _build_release_notes(
+            release_notes_ko=release_notes_ko,
+            release_notes_en=release_notes_en,
+        )
 
         track_body = {
             "track": track,
@@ -286,8 +362,98 @@ def deploy_track(
         service.edits().commit(packageName=package_name, editId=edit_id).execute()
 
         return (
-            f"Successfully deployed to {track_display[track]} track.\n"
+            f"Successfully deployed to {TRACK_DISPLAY[track]} track.\n"
             f"Version code: {version_code}\n"
+            f"Status: {status}\n"
+            f"Edit ID: {edit_id}"
+        )
+
+    except Exception as e:
+        try:
+            service.edits().delete(packageName=package_name, editId=edit_id).execute()
+        except Exception:
+            pass
+        raise e
+
+
+@mcp.tool()
+def promote_track_release(
+    source_track: str,
+    target_track: str,
+    version_codes_json: str = "",
+    release_notes_ko: str = "",
+    release_notes_en: str = "",
+    status: str = "completed",
+) -> str:
+    """Promote an existing uploaded release from one track to another.
+
+    This tool reuses an already uploaded Google Play artifact instead of
+    uploading a new AAB. It reads a release from the source track and writes
+    a matching release into the target track.
+
+    Args:
+        source_track: Track that already contains the uploaded release.
+        target_track: Track to receive the promoted release.
+        version_codes_json: Optional JSON array of version codes to promote.
+            When omitted, the latest release on the source track is used.
+        release_notes_ko: Korean release notes override.
+        release_notes_en: English release notes override.
+        status: Target track release status. Defaults to "completed".
+
+    Returns:
+        A message indicating the promoted version codes and edit ID.
+    """
+    _validate_track_name(source_track)
+    _validate_track_name(target_track)
+
+    if source_track == target_track:
+        raise ValueError("source_track and target_track must be different.")
+
+    service = _get_service()
+    package_name = _get_package_name()
+    version_codes = _parse_version_codes_json(version_codes_json)
+    release_notes = _build_release_notes(
+        release_notes_ko=release_notes_ko,
+        release_notes_en=release_notes_en,
+    )
+
+    edit = service.edits().insert(packageName=package_name, body={}).execute()
+    edit_id = edit["id"]
+
+    try:
+        source_track_result = service.edits().tracks().get(
+            packageName=package_name,
+            editId=edit_id,
+            track=source_track,
+        ).execute()
+
+        source_release = _select_release_to_promote(
+            source_track_result.get("releases", []),
+            version_codes,
+        )
+        promoted_release = _build_promoted_release(
+            source_release=source_release,
+            status=status,
+            release_notes=release_notes,
+        )
+
+        service.edits().tracks().update(
+            packageName=package_name,
+            editId=edit_id,
+            track=target_track,
+            body={
+                "track": target_track,
+                "releases": [promoted_release],
+            },
+        ).execute()
+
+        service.edits().commit(packageName=package_name, editId=edit_id).execute()
+
+        promoted_codes = promoted_release.get("versionCodes", [])
+        return (
+            f"Successfully promoted release from {source_track} to "
+            f"{target_track}.\n"
+            f"Version codes: {promoted_codes}\n"
             f"Status: {status}\n"
             f"Edit ID: {edit_id}"
         )
@@ -343,11 +509,10 @@ def deploy_production(
         ).execute()
         version_code = bundle["versionCode"]
 
-        release_notes = []
-        if release_notes_ko:
-            release_notes.append({"language": "ko-KR", "text": release_notes_ko})
-        if release_notes_en:
-            release_notes.append({"language": "en-US", "text": release_notes_en})
+        release_notes = _build_release_notes(
+            release_notes_ko=release_notes_ko,
+            release_notes_en=release_notes_en,
+        )
 
         release = {
             "versionCodes": [str(version_code)],
