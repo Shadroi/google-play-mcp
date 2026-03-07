@@ -54,4 +54,7 @@ Thumbs.db
 *.apk
 !locales.json
 
+# Local planning docs
+docs/plans/
+
 .agent/
