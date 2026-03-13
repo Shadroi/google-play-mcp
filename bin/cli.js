@@ -47,13 +47,36 @@ async function setupEnvironment() {
     // Create venv if it doesn't exist
     if (!fs.existsSync(venvDir)) {
         console.log('Creating .venv...');
-        try {
-            await runCommand('python3', ['-m', 'venv', '.venv']);
-        } catch (e) {
-            // Try just 'python' if 'python3' fails (e.g. Windows)
-            await runCommand('python', ['-m', 'venv', '.venv']);
+
+        // Try newer Python versions first (mcp[cli] requires Python >= 3.10)
+        const pythonCandidates = [
+            'python3.13', 'python3.12', 'python3.11', 'python3.10',
+            'python3', 'python'
+        ];
+
+        let created = false;
+        for (const py of pythonCandidates) {
+            try {
+                await runCommand(py, ['-m', 'venv', '.venv']);
+                console.log(`Created venv using ${py}`);
+                created = true;
+                break;
+            } catch (e) {
+                // Try next candidate
+            }
+        }
+
+        if (!created) {
+            throw new Error(
+                'Could not find a suitable Python >= 3.10. ' +
+                'Please install Python 3.10+ (e.g. brew install python@3.13)'
+            );
         }
     }
+
+    // Upgrade pip first to avoid compatibility issues
+    console.log('Upgrading pip...');
+    await runCommand(pythonExecutable, ['-m', 'pip', 'install', '--upgrade', 'pip']);
 
     // Install dependencies
     if (fs.existsSync(requirementsFile)) {

@@ -27,7 +27,8 @@ A Model Context Protocol (MCP) server for managing Google Play app deployment an
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.10+ (the CLI auto-detects the best available version)
+- Node.js 16+
 - Google Cloud service account with Google Play Developer API access
 - App registered in Google Play Console
 
@@ -273,6 +274,25 @@ Google's `convertRegionPrices` API.
 | `alpha` | Closed testing |
 | `beta` | Open testing |
 | `production` | Production release |
+
+## Troubleshooting
+
+### Python version errors
+
+The `mcp[cli]` package requires **Python 3.10+**. The CLI automatically tries `python3.13`, `python3.12`, `python3.11`, `python3.10` before falling back to `python3`. If you see errors like `No matching distribution found for mcp[cli]`, install a newer Python:
+
+```bash
+# macOS (Homebrew)
+brew install python@3.13
+
+# Then delete the old venv and re-run
+rm -rf .venv
+google-play-mcp init-key
+```
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for a list of changes.
 
 ## License
 

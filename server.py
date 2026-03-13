@@ -836,6 +836,10 @@ def create_subscription_product(
     Returns:
         Success message with subscription details.
     """
+    from urllib.parse import quote
+    import requests as req_lib
+    from google.auth.transport.requests import Request as AuthRequest
+
     service = _get_service()
     package_name = _get_package_name()
 
@@ -851,7 +855,7 @@ def create_subscription_product(
         price = price_data["price"]
         regional_configs.append({
             "regionCode": region_code,
-            "newSubscriberAvailability": "AVAILABLE",
+            "newSubscriberAvailability": True,
             "price": {
                 "currencyCode": price["currencyCode"],
                 "units": price.get("units", "0"),
@@ -885,17 +889,34 @@ def create_subscription_product(
         }],
     }
 
-    request = service.monetization().subscriptions().patch(
-        packageName=package_name,
-        productId=product_id,
-        body=body,
-        allowMissing=True,
-        updateMask="listings,basePlans",
+    # Bypass the google-api-python-client discovery serialization which
+    # converts newSubscriberAvailability: True -> "AVAILABLE" (string).
+    # Make a raw HTTP PATCH request instead.
+    encoded_version = quote(regions_version, safe="")
+    url = (
+        f"https://androidpublisher.googleapis.com/androidpublisher/v3"
+        f"/applications/{package_name}/subscriptions/{product_id}"
+        f"?allowMissing=true"
+        f"&updateMask=listings%2CbasePlans"
+        f"&regionsVersion.version={encoded_version}"
     )
 
-    sep = "&" if "?" in request.uri else "?"
-    request.uri += f"{sep}regionsVersion.version={regions_version}"
-    request.execute()
+    credentials = service._http.credentials
+    credentials.refresh(AuthRequest())
+    response = req_lib.patch(
+        url,
+        json=body,
+        headers={
+            "Authorization": f"Bearer {credentials.token}",
+            "Content-Type": "application/json",
+        },
+    )
+
+    if response.status_code >= 400:
+        raise Exception(
+            f"HTTP {response.status_code} creating subscription: "
+            f"{response.text}"
+        )
 
     return (
         f"Successfully created/updated subscription product.\n"
